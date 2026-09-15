@@ -1,5 +1,5 @@
 # RainDrop
-A simple, straightforward way to share links and images across devices on the same local network. No setup required, no clutter, and completely local.
+A simple, straightforward way to share links and images across devices on the same local network. No setup required, no clutter, and completely local. IP not required.
 
 ![banner](screenshots/raindropbanner.png)
 
