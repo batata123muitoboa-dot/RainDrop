@@ -4,15 +4,61 @@ import time
 import webbrowser
 import os
 import base64
+import sys
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import customtkinter as ctk
+from tkinter import filedialog
+import pystray
+from PIL import Image, ImageDraw
 
 PORTA = 5000
 
-# Pasta para salvar as imagens recebidas
+def auto_desanexar():
+    if "--bg" not in sys.argv:
+        cmd = [sys.executable] + sys.argv + ["--bg"]
+        kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL
+        }
+        
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
+
+        subprocess.Popen(cmd, **kwargs)
+        sys.exit(0)
+
 SAVE_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "RainDrop")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 EMOJI_FONT = ("Noto Color Emoji", "Segoe UI Emoji", "Apple Color Emoji", "DejaVu Sans")
+
+def get_default_gateway():
+    if sys.platform == "win32":
+        try:
+            out = subprocess.check_output("route print 0.0.0.0", shell=True).decode('utf-8', errors='ignore')
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[0] == "0.0.0.0":
+                    return parts[2]
+        except Exception:
+            pass
+        return None
+    else:
+        try:
+            with open("/proc/net/route", "r") as f:
+                for line in f:
+                    fields = line.strip().split()
+                    if len(fields) >= 3 and fields[1] == '00000000':
+                        gw_hex = fields[2]
+                        ip_bytes = bytes.fromhex(gw_hex)[::-1]
+                        return socket.inet_ntoa(ip_bytes)
+        except Exception:
+            pass
+        return None
 
 def get_meus_ips():
     ips = ['127.0.0.1']
@@ -31,14 +77,12 @@ class ConfirmPopup(ctk.CTkToplevel):
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         
-        # Centraliza o pop-up na tela
         largura, altura = 360, 160
         x = (self.winfo_screenwidth() // 2) - (largura // 2)
         y = (self.winfo_screenheight() // 2) - (altura // 2)
         self.geometry(f"{largura}x{altura}+{x}+{y}")
         self.configure(fg_color="#0F172A")
 
-        # Borda customizada com um frame
         frame = ctk.CTkFrame(self, fg_color="#1E293B", border_width=1, border_color="#334155", corner_radius=12)
         frame.pack(fill="both", expand=True, padx=2, pady=2)
 
@@ -156,12 +200,13 @@ class RainDropApp(ctk.CTk):
         super().__init__()
         self.withdraw()
         self.title("RainDrop")
-        self.geometry("480x400")
+        self.geometry("480x440")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         self.receber_si_mesmo = ctk.BooleanVar(value=False)
         self.meus_ips = get_meus_ips()
+        self.ultimo_ip_conhecido = None
         self.ultimo_envio = 0
         self.timer_status = None
 
@@ -178,30 +223,68 @@ class RainDropApp(ctk.CTk):
         self.label_titulo.pack(pady=(20, 2))
 
         self.label_slogan = ctk.CTkLabel(self, text="Because Air is overrated.", font=("Helvetica", 12, "italic"), text_color="#94A3B8")
-        self.label_slogan.pack(pady=(0, 20))
+        self.label_slogan.pack(pady=(0, 15))
 
-        self.entry_ip = ctk.CTkEntry(self, placeholder_text="IP (vazio para Auto-Discovery)", width=360, height=40, corner_radius=10)
-        self.entry_ip.pack(pady=8)
+        self.entry_ip = ctk.CTkEntry(self, placeholder_text="IP (deixe em branco para Auto-Find)", width=360, height=40, corner_radius=10)
+        self.entry_ip.pack(pady=6)
         
         self.entry_url = ctk.CTkEntry(self, placeholder_text="https://google.com", width=360, height=40, corner_radius=10)
         self.entry_url.insert(0, "https://google.com")
-        self.entry_url.pack(pady=8)
+        self.entry_url.pack(pady=6)
 
         frame_botoes = ctk.CTkFrame(self, fg_color="transparent")
-        frame_botoes.pack(pady=14)
+        frame_botoes.pack(pady=12)
 
         self.btn_send_link = ctk.CTkButton(
             frame_botoes, text="Mandar Link 🌊", command=self.enviar_link, 
-            fg_color="#0284C7", hover_color="#0369A1", width=220, height=42, corner_radius=10,
+            fg_color="#0284C7", hover_color="#0369A1", width=175, height=42, corner_radius=10,
             font=("Helvetica", 13, "bold")
         )
-        self.btn_send_link.pack(padx=5)
+        self.btn_send_link.pack(side="left", padx=5)
 
-        self.label_status = ctk.CTkLabel(self, text="Escutando TCP e UDP na porta 5000...", text_color="#94A3B8")
+        self.btn_send_img = ctk.CTkButton(
+            frame_botoes, text="Mandar Imagem 🖼️", command=self.enviar_imagem, 
+            fg_color="#0EA5E9", hover_color="#0284C7", width=175, height=42, corner_radius=10,
+            font=("Helvetica", 13, "bold")
+        )
+        self.btn_send_img.pack(side="left", padx=5)
+
+        self.label_status = ctk.CTkLabel(self, text="Escutando na porta 5000...", text_color="#94A3B8")
         self.label_status.pack(pady=10)
 
         threading.Thread(target=self.iniciar_servidor_tcp, daemon=True).start()
         threading.Thread(target=self.iniciar_servidor_udp, daemon=True).start()
+
+        self.criar_icone_tray()
+
+    def criar_icone_tray(self):
+        image = Image.new('RGBA', (64, 64), color=(0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.polygon([(32, 10), (14, 42), (50, 42)], fill='#0284C7')
+        draw.ellipse((14, 26, 50, 58), fill='#0284C7')
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Abrir RainDrop", self.mostrar_janela, default=True),
+            pystray.MenuItem("Sair", self.encerrar_app)
+        )
+
+        self.tray_icon = pystray.Icon("RainDrop", image, "RainDrop", menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+        self.protocol("WM_DELETE_WINDOW", self.esconder_janela)
+
+    def esconder_janela(self):
+        self.withdraw()
+
+    def mostrar_janela(self, icon=None, item=None):
+        self.deiconify()
+        self.focus_force()
+
+    def encerrar_app(self, icon=None, item=None):
+        if hasattr(self, 'tray_icon'):
+            self.tray_icon.stop()
+        self.destroy()
+        os._exit(0)
 
     def abrir_menu(self):
         x = self.btn_menu.winfo_rootx()
@@ -209,10 +292,10 @@ class RainDropApp(ctk.CTk):
         MenuPopup(self, self.receber_si_mesmo, x, y)
 
     def resetar_status(self):
-        self.label_status.configure(text="Escutando TCP e UDP na porta 5000...", text_color="#94A3B8")
+        self.label_status.configure(text="Escutando na porta 5000...", text_color="#94A3B8")
         self.timer_status = None
 
-    def atualizar_status(self, texto, cor, temporario=True, delay_ms=2000):
+    def atualizar_status(self, texto, cor, temporario=True, delay_ms=2500):
         if self.timer_status:
             self.after_cancel(self.timer_status)
             self.timer_status = None
@@ -224,48 +307,56 @@ class RainDropApp(ctk.CTk):
 
     def checar_cooldown(self):
         agora = time.time()
-        if agora - self.ultimo_envio < 5.0:
-            self.atualizar_status("Err: Enviando requisições muito rápido.", "#EF4444")
+        if agora - self.ultimo_envio < 1.0:
+            self.atualizar_status("Aguarde um instante...", "#EF4444")
             return False
         self.ultimo_envio = agora
         return True
 
-    def descobrir_dispositivos(self, timeout=1.5):
+    def descobrir_dispositivos(self):
         encontrados = set()
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.settimeout(0.2)
 
-            ip_broadcast = '255.255.255.255'
-            for ip in self.meus_ips:
-                if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
-                    partes = ip.split('.')
-                    ip_broadcast = f"{partes[0]}.{partes[1]}.{partes[2]}.255"
-                    break
+        def checar_ip_unicast(target_ip):
+            if not self.receber_si_mesmo.get() and target_ip in self.meus_ips:
+                return None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(0.4)
+                s.sendto(b"RD_DISCOVERY_REQ", (target_ip, PORTA))
+                data, addr = s.recvfrom(512)
+                msg = data.decode('utf-8', errors='ignore').strip()
+                s.close()
+                if msg == "RD_DISCOVERY_RES":
+                    return addr[0]
+            except Exception:
+                pass
+            return None
 
-            for _ in range(3):
-                sock.sendto(b"RD_DISCOVERY_REQ", (ip_broadcast, PORTA))
-                if ip_broadcast != '255.255.255.255':
-                    sock.sendto(b"RD_DISCOVERY_REQ", ('255.255.255.255', PORTA))
-                time.sleep(0.05)
+        gw = get_default_gateway()
+        if gw:
+            res_gw = checar_ip_unicast(gw)
+            if res_gw:
+                encontrados.add(res_gw)
+                self.ultimo_ip_conhecido = res_gw
+                return list(encontrados)
 
-            inicio = time.time()
-            while time.time() - inicio < timeout:
-                try:
-                    data, addr = sock.recvfrom(1024)
-                    ip_remoto = addr[0]
-                    msg = data.decode('utf-8', errors='ignore').strip()
-                    if msg == "RD_DISCOVERY_RES":
-                        if self.receber_si_mesmo.get() or ip_remoto not in self.meus_ips:
-                            encontrados.add(ip_remoto)
-                except socket.timeout:
-                    continue
-                except Exception:
-                    break
-            sock.close()
-        except Exception:
-            pass
+        prefixos = set()
+        for ip in self.meus_ips:
+            if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+                partes = ip.split('.')
+                prefixos.add(f"{partes[0]}.{partes[1]}.{partes[2]}.")
+
+        with ThreadPoolExecutor(max_workers=100) as executor:
+            futures = []
+            for prefixo in prefixos:
+                for i in range(1, 255):
+                    futures.append(executor.submit(checar_ip_unicast, f"{prefixo}{i}"))
+            for f in futures:
+                res = f.result()
+                if res:
+                    encontrados.add(res)
+                    self.ultimo_ip_conhecido = res
+
         return list(encontrados)
 
     def enviar_link(self):
@@ -279,7 +370,11 @@ class RainDropApp(ctk.CTk):
 
         def task():
             try:
+                self.atualizar_status("Escaneando rede. Aguarde.", "#38BDF8", temporario=False)
                 alvos = [ip_destino] if ip_destino and ip_destino != "255.255.255.255" else self.descobrir_dispositivos()
+
+                if not alvos and self.ultimo_ip_conhecido:
+                    alvos = [self.ultimo_ip_conhecido]
 
                 if not alvos:
                     client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -302,9 +397,57 @@ class RainDropApp(ctk.CTk):
 
         threading.Thread(target=task).start()
 
+    def enviar_imagem(self):
+        if not self.checar_cooldown(): return
+
+        caminho_arquivo = filedialog.askopenfilename(
+            title="Selecione uma imagem",
+            filetypes=[("Imagens", "*.png *.jpg *.jpeg *.gif *.webp")]
+        )
+        if not caminho_arquivo:
+            return
+
+        ip_destino = self.entry_ip.get().strip()
+
+        def task():
+            try:
+                self.atualizar_status("Escaneando rede. Aguarde.", "#38BDF8", temporario=False)
+                
+                alvos = [ip_destino] if ip_destino and ip_destino != "255.255.255.255" else self.descobrir_dispositivos()
+
+                if not alvos and self.ultimo_ip_conhecido:
+                    alvos = [self.ultimo_ip_conhecido]
+
+                if not alvos:
+                    self.atualizar_status("Nenhum dispositivo encontrado na rede.", "#EF4444")
+                    return
+
+                nome_arquivo = os.path.basename(caminho_arquivo)
+                tamanho_bytes = os.path.getsize(caminho_arquivo)
+
+                with open(caminho_arquivo, "rb") as f:
+                    dados_imagem = f.read()
+
+                header = f"IMG:{nome_arquivo}:{tamanho_bytes}\n".encode('utf-8')
+
+                for ip in alvos:
+                    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    client.settimeout(10)
+                    client.connect((ip, PORTA))
+                    client.sendall(header + dados_imagem)
+                    client.close()
+
+                self.atualizar_status(f"Imagem enviada para {len(alvos)} dispositivo(s)! 🖼️", "#22C55E")
+            except Exception as e:
+                self.atualizar_status(f"Erro ao enviar: {e}", "#EF4444")
+
+        threading.Thread(target=task).start()
+
     def processar_recebimento_seguro(self, tipo, payload, extra_info, addr_str):
+        if addr_str not in self.meus_ips:
+            self.ultimo_ip_conhecido = addr_str
+
         if tipo == "LINK":
-            # Ignora se começar com RD_DISCOVERY
             if payload.startswith("RD_DISCOVERY"):
                 return
 
@@ -351,6 +494,9 @@ class RainDropApp(ctk.CTk):
                     conn.close()
                     continue
 
+                if addr_str not in self.meus_ips:
+                    self.ultimo_ip_conhecido = addr_str
+
                 buffer = bytearray()
                 conn.settimeout(5.0)
                 try:
@@ -361,7 +507,6 @@ class RainDropApp(ctk.CTk):
                 except socket.timeout:
                     pass
 
-                # Ignora logo de cara se o buffer começar com RD_DISCOVERY
                 if buffer.startswith(b"RD_DISCOVERY"):
                     conn.close()
                     continue
@@ -416,7 +561,9 @@ class RainDropApp(ctk.CTk):
                 if not data: continue
                 addr_str = addr[0]
                 
-                # Ignora se começar com RD_DISCOVERY (tratamento específico para requisições de descoberta)
+                if addr_str not in self.meus_ips:
+                    self.ultimo_ip_conhecido = addr_str
+
                 if data.startswith(b"RD_DISCOVERY"):
                     if data.strip() == b"RD_DISCOVERY_REQ":
                         if self.receber_si_mesmo.get() or addr_str not in self.meus_ips:
@@ -448,5 +595,6 @@ class RainDropApp(ctk.CTk):
         except Exception as e: print(f"[UDP ERROR] {e}")
 
 if __name__ == "__main__":
+    auto_desanexar()
     app = RainDropApp()
     app.mainloop()
